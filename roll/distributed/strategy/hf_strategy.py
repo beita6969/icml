@@ -31,6 +31,8 @@ class HfInferStrategy(InferenceStrategy):
         super().__init__(worker)
         self.executor: futures.ThreadPoolExecutor = futures.ThreadPoolExecutor(max_workers=1)
         self.generate_config = None
+        # HfInferStrategy doesn't use a server thread, so set running to True immediately
+        self.running = True
 
     def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
@@ -134,6 +136,9 @@ class HfInferStrategy(InferenceStrategy):
 
     # 参数同步相关接口
     def broadcast_bucket(self, model_update_name, src_pp_rank, meta_infos, bucket_size):
+        # Check if model_update_name exists in comm_plan
+        if model_update_name not in self.model_update_comm_plan:
+            return
         if src_pp_rank not in self.model_update_comm_plan[model_update_name]:
             return
         comm_plan = self.model_update_comm_plan[model_update_name][src_pp_rank]
@@ -145,17 +150,31 @@ class HfInferStrategy(InferenceStrategy):
         assert (
             self.worker_config.num_gpus_per_worker == 1
         ), "hf generate only support on device, please use vllm instead."
+        # Check if model_update_name exists in comm_plan
+        if model_update_name not in self.model_update_comm_plan:
+            return
         if src_pp_rank not in self.model_update_comm_plan[model_update_name]:
             return
         comm_plan = self.model_update_comm_plan[model_update_name][src_pp_rank]
         weight = torch.empty(shape, dtype=dtype, device=current_platform.device_type)
         collective.broadcast(tensor=weight, src_rank=0, group_name=comm_plan["group_name"])
-        self.update_parameter(model_update_name, parameter_name, weight, [dist.get_rank()])
+        self.update_parameter(model_update_name, parameter_name, weight, [dist.get_rank()], is_lora=is_lora)
 
-    def update_parameter(self, model_update_name, parameter_name, weight, ranks_in_worker):
+    def update_parameter(self, model_update_name, parameter_name, weight, ranks_in_worker, is_lora=False):
         if dist.get_rank() not in ranks_in_worker:
             return
-        param = self.model.get_parameter(parameter_name)
+        # For LoRA models, use named_parameters() to access parameters
+        # For regular models, use get_parameter()
+        if is_lora or hasattr(self.model, 'peft_config'):
+            param_dict = dict(self.model.named_parameters())
+            if parameter_name in param_dict:
+                param = param_dict[parameter_name]
+            else:
+                # Parameter not found, skip silently
+                del weight
+                return
+        else:
+            param = self.model.get_parameter(parameter_name)
         param.data.copy_(weight)
         del weight
 
@@ -178,3 +197,11 @@ class HfInferStrategy(InferenceStrategy):
         if include is None or OffloadStateType.model_params in include:
             offload_hf_model(model=self.model)
         current_platform.empty_cache()
+
+    def add_lora(self, peft_config):
+        """Add LoRA to the model.
+
+        For HuggingFace models with PEFT, the LoRA is already integrated during model initialization,
+        so this method is a no-op. The LoRA parameters are synchronized via broadcast_parameter().
+        """
+        logger.info(f"LoRA configuration: {peft_config}. HuggingFace PEFT model already has LoRA integrated.")
