@@ -2,6 +2,8 @@ from concurrent import futures
 from collections import defaultdict
 from datetime import timedelta
 from typing import List, Optional, Callable, Dict, Tuple
+import queue
+import time
 
 import deepspeed
 import torch
@@ -9,6 +11,7 @@ import torch.distributed as dist
 from accelerate import cpu_offload_with_hook
 from accelerate.hooks import UserCpuOffloadHook
 from roll.utils.collective import collective
+from roll.utils.functionals import GenerateRequestType
 from torch.nn.utils.rnn import pad_sequence
 from transformers import set_seed
 
@@ -31,8 +34,9 @@ class HfInferStrategy(InferenceStrategy):
         super().__init__(worker)
         self.executor: futures.ThreadPoolExecutor = futures.ThreadPoolExecutor(max_workers=1)
         self.generate_config = None
-        # HfInferStrategy doesn't use a server thread, so set running to True immediately
-        self.running = True
+        self.command_queue = None
+        self.running = False
+        self.request_outputs = {}
 
     def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
@@ -102,14 +106,15 @@ class HfInferStrategy(InferenceStrategy):
             logger.info(f"generate_config: {self.generate_config}")
 
         batch_size = batch.batch.batch_size[0]
-        micro_batch_size = batch.meta_info["micro_batch_size"]
+        # Use batch_size as default if micro_batch_size is not provided
+        micro_batch_size = batch.meta_info.get("micro_batch_size", batch_size)
         num_microbatches = max(batch_size // micro_batch_size, 1)
         micro_batches = batch.chunk(chunks=num_microbatches)
 
         output_list = []
         for data in micro_batches:
-            input_ids = data.batch["input_ids"]  # (bs, prompt_length)
-            attention_mask = data.batch["attention_mask"]  # left-padded attention_mask
+            input_ids = data.batch["input_ids"].to(self.model.device)  # (bs, prompt_length)
+            attention_mask = data.batch["attention_mask"].to(self.model.device)  # left-padded attention_mask
             forward_args = data.meta_info.get("forward_args", {})
             if "multi_modal_inputs" in data.non_tensor_batch:
                 multi_modal_inputs = data.non_tensor_batch["multi_modal_inputs"]
@@ -130,6 +135,55 @@ class HfInferStrategy(InferenceStrategy):
         output = pad_sequence(output_list, batch_first=True, padding_value=generation_config["pad_token_id"])
 
         return output
+
+    def start_server(self, data: DataProto, request_complete_callback):
+        """Start the generation server loop.
+
+        This method runs in a separate thread created by base_worker.py and processes
+        generation requests from a command queue.
+        """
+        self.command_queue = queue.Queue()
+        self.running = True
+
+        while True:
+            try:
+                while not self.command_queue.empty():
+                    command, batch = self.command_queue.get_nowait()
+
+                    if command == GenerateRequestType.ADD:
+                        request_id = batch.meta_info["request_id"]
+                        generation_config = batch.meta_info.get("generation_config")
+
+                        # Call generate() synchronously
+                        output = self.generate(batch, generation_config)
+
+                        # Prepare result and call completion callback
+                        result_batch = DataProto(batch={"output_ids": output})
+                        result_batch.meta_info["request_id"] = request_id
+                        request_complete_callback(result_batch)
+
+                    elif command == GenerateRequestType.ALIVE_CHECK:
+                        # Alive check - no action needed, just consume the command
+                        pass
+
+                    elif command == GenerateRequestType.STOP:
+                        logger.info("Stopping HfInferStrategy server")
+                        self.running = False
+                        return
+
+                # Small sleep to avoid busy waiting
+                time.sleep(0.001)
+
+            except Exception as e:
+                logger.error(f"Error in HfInferStrategy server loop: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise e
+
+    def add_request(self, command, data: DataProto):
+        """Add a request to the command queue."""
+        if self.command_queue is not None:
+            self.command_queue.put((command, data))
 
     def unwrap_model(self):
         return self.model
