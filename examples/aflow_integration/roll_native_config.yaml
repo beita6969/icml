@@ -1,0 +1,319 @@
+# ==============================================================================
+# AFlow + ROLL Integration Configuration
+# ==============================================================================
+# This configuration trains a Qwen model using GRPO for AFlow workflow optimization
+# across multiple reasoning domains: MATH, GSM8K, HumanEval, MBPP, HotpotQA, DROP
+
+# Hydra configuration
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# ==============================================================================
+# Global Configuration
+# ==============================================================================
+exp_name: "aflow-roll-native-qwen-8b-grpo"
+seed: 42
+logging_dir: /home/username/logs/roll_native_training
+output_dir: /home/username/output/roll_native_training
+base_dir: /home/username/output/roll_native_training
+
+# System environment variables
+system_envs:
+  USE_MODELSCOPE: '0'  # Use HuggingFace
+
+# Checkpoint configuration
+checkpoint_config:
+  type: file_system
+  output_dir: /home/username/checkpoints/${exp_name}
+
+# Tracking configuration
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: /home/username/logs/aflow_training/tensorboard
+
+# Hardware configuration
+num_gpus_per_node: 1  # Single A100 GPU
+num_nodes: 1
+
+# ==============================================================================
+# Training Schedule
+# ==============================================================================
+max_steps: 1000
+save_steps: 100
+logging_steps: 10
+eval_steps: 50
+resume_from_checkpoint: false
+
+# ==============================================================================
+# LoRA Configuration (Memory Optimization)
+# ==============================================================================
+# LoRA reduces GPU memory usage by 70-90%
+lora_target: o_proj,q_proj,k_proj,v_proj,gate_proj,up_proj,down_proj
+lora_rank: 32
+lora_alpha: 64  # Typically 2x lora_rank
+lora_dropout: 0.05
+
+# ==============================================================================
+# GRPO Algorithm Configuration
+# ==============================================================================
+rollout_batch_size: 16  # Reduced for single GPU
+adv_estimator: "grpo"  # Group Relative Policy Optimization
+num_return_sequences_in_group: 4  # Reduced for memory constraints
+
+# Sequence lengths
+prompt_length: 1024
+response_length: 2048
+sequence_length: 3072  # prompt_length + response_length
+
+# Validation lengths
+val_prompt_length: 1024
+val_sequence_length: 3072
+
+# PPO configuration
+ppo_epochs: 1
+use_kl_loss: true
+kl_loss_coef: 0.001
+loss_agg_mode: "seq-mean-token-mean"
+
+# Advantage configuration
+whiten_advantages: true
+advantage_clip: 2.0
+dual_clip_loss: true
+
+# Reward configuration
+reward_clip: 10
+reward_norm: null
+reward_shift: false
+reward_scale: false
+add_token_level_kl: false
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+pretrain: /home/username/.cache/huggingface/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+reward_pretrain: /home/username/.cache/huggingface/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+
+# ==============================================================================
+# Actor Training Configuration
+# ==============================================================================
+actor_train:
+  model_args:
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+    # LoRA configuration
+    lora_target: ${lora_target}
+    lora_rank: ${lora_rank}
+    lora_alpha: ${lora_alpha}
+    lora_dropout: ${lora_dropout}
+
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8
+    warmup_steps: 50
+    num_train_epochs: 50
+
+  data_args:
+    template: qwen3
+    file_name:
+      - data/math_validate.jsonl
+      - data/gsm8k_validate.jsonl
+      - data/humaneval_validate.jsonl
+      - data/mbpp_validate.jsonl
+      - data/hotpotqa_validate.jsonl
+      - data/drop_validate.jsonl
+    domain_interleave_probs:
+      math: 0.3      # MATH dataset
+      gsm8k: 0.2     # GSM8K dataset
+      code_human: 0.2     # HumanEval dataset
+      code_mbpp: 0.15    # MBPP dataset
+      qa_hotpot: 0.1     # HotpotQA dataset
+      qa_drop: 0.05      # DROP dataset
+    dataset_dir: data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 4
+
+  strategy_args:
+    strategy_name: deepspeed_train  # Using DeepSpeed with ZeRO for memory efficiency
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 1.0e+9
+        overlap_comm: true
+        reduce_scatter: true
+        reduce_bucket_size: 5.0e+8
+        contiguous_gradients: true
+
+  device_mapping: list(range(0,1))  # Single GPU
+  infer_batch_size: 1
+
+# ==============================================================================
+# Actor Inference Configuration
+# ==============================================================================
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    # LoRA configuration (must match training)
+    lora_target: ${lora_target}
+    lora_rank: ${lora_rank}
+    lora_alpha: ${lora_alpha}
+
+  generating_args:
+    max_new_tokens: 2048
+    top_p: 0.95
+    top_k: 50
+    num_beams: 1
+    temperature: 0.8
+    num_return_sequences: 4  # Must match num_return_sequences_in_group
+
+  data_args:
+    template: qwen3
+
+  strategy_args:
+    strategy_name: hf_infer  # Using HuggingFace since vLLM unavailable
+    strategy_config: null
+
+  device_mapping: list(range(0,1))
+  infer_batch_size: 1
+
+# ==============================================================================
+# Reference Model Configuration
+# ==============================================================================
+reference:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+
+  data_args:
+    template: qwen3
+
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: null
+
+  device_mapping: list(range(0,1))
+  infer_batch_size: 2
+
+# ==============================================================================
+# Critic Model Configuration (Optional for GRPO)
+# ==============================================================================
+critic:
+  model_args:
+    model_name_or_path: ${reward_pretrain}  # Required even if not used in GRPO
+  training_args:
+    learning_rate: 1.0e-6
+  strategy_args:
+    strategy_name: hf_infer
+  device_mapping: "[]"  # Empty list for GRPO (critic not used)
+
+# ==============================================================================
+# Validation Configuration
+# ==============================================================================
+validation:
+  data_args:
+    template: qwen3
+    file_name:
+      - data/math_validate.jsonl
+    messages: messages
+
+  generating_args:
+    max_new_tokens: 2048
+    top_p: 0.6
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
+
+# ==============================================================================
+# Multi-Domain Reward Workers (ROLL Native - GeneralValRuleRewardWorker)
+# ==============================================================================
+rewards:
+  # MATH Domain - ROLL native reward worker
+  math:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [math]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+
+  # GSM8K Domain - ROLL native reward worker
+  gsm8k:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [gsm8k]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+
+  # HumanEval Domain - ROLL native reward worker
+  code_human:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [code_human]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+
+  # MBPP Domain - ROLL native reward worker
+  code_mbpp:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [code_mbpp]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+
+  # HotpotQA Domain - ROLL native reward worker
+  qa_hotpot:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [qa_hotpot]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+
+  # DROP Domain - ROLL native reward worker
+  qa_drop:
+    worker_cls: roll.pipeline.rlvr.rewards.general_val_rule_reward_worker.GeneralValRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen2_5
+    tag_included: [qa_drop]
+    world_size: 1
+    infer_batch_size: 1
+    device_mapping: list(range(0,1))
+

@@ -515,7 +515,14 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         peft_model = self.unwrap_model()
         if not self.ds_config.is_zero3():
             lora_state_dict = get_peft_model_state_dict(peft_model)
-            return lora_state_dict
+            # Convert dict to list of tuples for consistent iteration
+            # Use named_parameters dict for proper parameter access
+            param_dict = dict(peft_model.named_parameters())
+            lora_params = []
+            for name in lora_state_dict.keys():
+                param = param_dict[name]  # Dictionary lookup instead of get_parameter()
+                lora_params.append((name, param))
+            return lora_params
 
         adapter_name = "default"
         state_dict = peft_model.state_dict()

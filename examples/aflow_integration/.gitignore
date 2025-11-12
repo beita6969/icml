@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Training outputs
+output/checkpoints/
+output/logs/
+logs/
+*.log
+nohup.out
+
+# Model cache
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Data (keep structure but ignore large files)
+*.parquet
+*.arrow
+
+# Ray
+/tmp/ray/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Tensorboard
+events.out.tfevents.*
+tensorboard/
